@@ -33,6 +33,7 @@ use codex_protocol::models::ImageReference as CoreImageReference;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
 use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::FileSystemAccessMode as CoreFileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath as CoreFileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry as CoreFileSystemSandboxEntry;
@@ -97,6 +98,22 @@ fn managed_hooks_requirements_default_interrupt_to_empty() {
         serde_json::from_value(value).expect("deserialize managed hooks requirements");
 
     assert_eq!(parsed.interrupt, Vec::new());
+}
+
+#[test]
+fn mcp_oauth_login_response_accepts_older_servers_without_login_id() {
+    let response = serde_json::from_value::<McpServerOauthLoginResponse>(json!({
+        "authorizationUrl": "https://example.com/authorize",
+    }))
+    .expect("older login response should deserialize");
+
+    assert_eq!(
+        response,
+        McpServerOauthLoginResponse {
+            authorization_url: "https://example.com/authorize".to_string(),
+            login_id: None,
+        }
+    );
 }
 
 #[test]
@@ -400,7 +417,7 @@ fn thread_items_list_round_trips() {
     let params = ThreadItemsListParams {
         thread_id: "thr_123".to_string(),
         turn_id: Some("turn_456".to_string()),
-        cursor: Some("cursor_1".to_string()),
+        cursor: Some(ThreadItemsListCursor::Opaque("cursor_1".to_string())),
         limit: Some(50),
         sort_direction: Some(SortDirection::Asc),
     };
@@ -415,6 +432,26 @@ fn thread_items_list_round_trips() {
             "sortDirection": "asc",
         })
     );
+    for cursor in [
+        json!("cursor_1"),
+        json!({"type": "item", "itemId": "item-1"}),
+        serde_json::Value::Null,
+    ] {
+        let mut value = serde_json::to_value(&params).unwrap();
+        value["cursor"] = cursor;
+        let request = serde_json::from_value::<ThreadItemsListParams>(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+    }
+    for invalid in [
+        json!({"type": "other", "itemId": "item-1"}),
+        json!({"type": "item"}),
+        json!({"type": "item", "itemId": 1}),
+        json!(42),
+    ] {
+        let mut value = serde_json::to_value(&params).unwrap();
+        value["cursor"] = invalid;
+        assert!(serde_json::from_value::<ThreadItemsListParams>(value).is_err());
+    }
     for (started_at_ms, completed_at_ms) in [
         (Some(1_789_855_978_123), Some(1_789_855_979_456)),
         (Some(1_789_855_978_123), None),
@@ -2634,6 +2671,7 @@ fn mcp_server_elicitation_response_serializes_nullable_content() {
 fn mcp_server_status_serializes_absent_server_info_as_null() {
     let response = ListMcpServerStatusResponse {
         data: vec![McpServerStatus {
+            tool_list_meta: None,
             server_capabilities: None,
             tools_error: None,
             name: "not-ready".to_string(),
@@ -2659,6 +2697,7 @@ fn mcp_server_status_serializes_absent_server_info_as_null() {
                 "httpOrigin": null,
                 "serverInfo": null,
                 "serverCapabilities": null,
+                "toolListMeta": null,
                 "tools": {},
                 "toolsError": null,
                 "resources": [],
@@ -2685,6 +2724,7 @@ fn mcp_server_status_accepts_older_inventory_without_runtime_status() {
     assert_eq!(
         status,
         McpServerStatus {
+            tool_list_meta: None,
             server_capabilities: None,
             tools_error: None,
             name: "older-server".to_string(),
@@ -2759,6 +2799,7 @@ fn mcp_server_status_updated_serializes_failure_reason() {
 fn mcp_server_status_serializes_absent_server_info_metadata_as_null() {
     let response = ListMcpServerStatusResponse {
         data: vec![McpServerStatus {
+            tool_list_meta: None,
             server_capabilities: None,
             tools_error: None,
             name: "initialized".to_string(),
@@ -2790,6 +2831,7 @@ fn mcp_server_status_serializes_absent_server_info_metadata_as_null() {
                 "pluginId": "lookup@test",
                 "httpOrigin": null,
                 "serverCapabilities": null,
+                "toolListMeta": null,
                 "serverInfo": {
                     "name": "lookup-server",
                     "title": null,
@@ -3294,12 +3336,9 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         source: CoreExecCommandSource::Agent,
         interaction_input: None,
         status: CoreCommandExecutionStatus::Completed,
-        stdout: Some("done\n".to_string()),
-        stderr: Some(String::new()),
         aggregated_output: Some("done\n".to_string()),
         exit_code: Some(0),
         duration: Some(Duration::from_millis(5)),
-        formatted_output: Some("done\n".to_string()),
     });
 
     assert_eq!(
@@ -3413,8 +3452,10 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     );
 
     let sub_agent_activity_item = TurnItem::SubAgentActivity(SubAgentActivityItem {
+        model: Some("gpt-5".into()),
+        reasoning_effort: Some(ReasoningEffort::High),
         id: "activity-1".to_string(),
-        kind: CoreSubAgentActivityKind::Completed,
+        kind: CoreSubAgentActivityKind::Started,
         agent_thread_id: receiver_thread_id,
         agent_path: codex_protocol::AgentPath::root()
             .join("worker")
@@ -3424,11 +3465,33 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     assert_eq!(
         ThreadItem::from(sub_agent_activity_item),
         ThreadItem::SubAgentActivity {
+            model: Some("gpt-5".into()),
+            reasoning_effort: Some(ReasoningEffort::High),
             id: "activity-1".to_string(),
-            kind: SubAgentActivityKind::Completed,
+            kind: SubAgentActivityKind::Started,
             agent_thread_id: receiver_thread_id.to_string(),
             agent_path: "/root/worker".to_string(),
         }
+    );
+
+    let old_activity: SubAgentActivityItem = serde_json::from_value(json!({
+        "id": "old-activity",
+        "kind": "started",
+        "agent_thread_id": receiver_thread_id,
+        "agent_path": "/root/worker",
+    }))
+    .unwrap();
+    let old_wire_activity: ThreadItem = serde_json::from_value(json!({
+        "type": "subAgentActivity",
+        "id": "old-activity",
+        "kind": "started",
+        "agentThreadId": receiver_thread_id,
+        "agentPath": "/root/worker",
+    }))
+    .unwrap();
+    assert_eq!(
+        ThreadItem::from(TurnItem::SubAgentActivity(old_activity)),
+        old_wire_activity
     );
 
     let search_item = TurnItem::WebSearch(CoreWebSearchItem {
@@ -4472,7 +4535,6 @@ fn plugin_share_list_response_serializes_share_items() {
         serde_json::to_value(PluginShareListResponse {
             data: vec![PluginShareListItem {
                 plugin: PluginSummary {
-                    extensions: None,
                     id: "gmail@openai-curated-remote".to_string(),
                     remote_plugin_id: Some(
                         "plugins~Plugin_00000000000000000000000000000000".to_string(),
@@ -4502,7 +4564,6 @@ fn plugin_share_list_response_serializes_share_items() {
         json!({
             "data": [{
                 "plugin": {
-                    "extensions": null,
                     "id": "gmail@openai-curated-remote",
                     "remotePluginId": "plugins~Plugin_00000000000000000000000000000000",
                     "version": null,
@@ -4555,7 +4616,6 @@ fn plugin_summary_defaults_missing_availability_to_available() {
 #[test]
 fn plugin_summary_round_trips_plan_eligibility_metadata() {
     let value = json!({
-        "extensions": null,
         "id": "gmail@openai-curated-remote",
         "remotePluginId": "plugins~Plugin_00000000000000000000000000000000",
         "version": null,
@@ -4733,6 +4793,10 @@ fn core_error_info_converts_to_camel_case() {
         (CoreCodexErrorInfo::BioPolicy, json!("other")),
         (CoreCodexErrorInfo::InvalidPrompt, json!("other")),
         (
+            CoreCodexErrorInfo::FlexUnavailable,
+            json!("flexUnavailable"),
+        ),
+        (
             CoreCodexErrorInfo::RateLimitExceeded,
             json!("rateLimitExceeded"),
         ),
@@ -4741,6 +4805,67 @@ fn core_error_info_converts_to_camel_case() {
             serde_json::to_value(CodexErrorInfo::from(core)).unwrap(),
             expected
         );
+    }
+}
+
+/// The catchall must keep the existing `other` string stable in both directions.
+#[test]
+fn codex_error_info_other_round_trips_as_string() {
+    assert_eq!(
+        serde_json::to_value(CodexErrorInfo::Other).unwrap(),
+        json!("other")
+    );
+    assert_eq!(
+        serde_json::from_value::<CodexErrorInfo>(json!("other")).unwrap(),
+        CodexErrorInfo::Other
+    );
+}
+
+/// Future unit variants must not prevent older clients from handling errors.
+#[test]
+fn codex_error_info_deserializes_unknown_string_as_other() {
+    assert_eq!(
+        serde_json::from_value::<CodexErrorInfo>(json!("futureError")).unwrap(),
+        CodexErrorInfo::Other
+    );
+}
+
+/// Future structured variants must fall back without retaining their unknown payload.
+#[test]
+fn codex_error_info_deserializes_unknown_object_as_other() {
+    assert_eq!(
+        serde_json::from_value::<CodexErrorInfo>(json!({
+            "futureError": {
+                "detail": "unknown",
+                "retryAfterSeconds": 30,
+            }
+        }))
+        .unwrap(),
+        CodexErrorInfo::Other
+    );
+}
+
+/// The catchall must not replace known structured variants with `Other`.
+#[test]
+fn codex_error_info_deserializes_known_object_without_falling_back() {
+    assert_eq!(
+        serde_json::from_value::<CodexErrorInfo>(json!({
+            "httpConnectionFailed": {
+                "httpStatusCode": 503,
+            }
+        }))
+        .unwrap(),
+        CodexErrorInfo::HttpConnectionFailed {
+            http_status_code: Some(503),
+        }
+    );
+}
+
+/// Only the two supported error wire shapes may reach the catchall.
+#[test]
+fn codex_error_info_rejects_unsupported_wire_shapes() {
+    for value in [json!(null), json!(true), json!(42), json!([])] {
+        assert!(serde_json::from_value::<CodexErrorInfo>(value).is_err());
     }
 }
 
@@ -4965,8 +5090,11 @@ fn turn_start_params_preserve_explicit_null_service_tier() {
         client_user_message_id: None,
         input: vec![],
         turn_trigger: None,
+        parent_turn_id: None,
+        root_turn_id: None,
         tool_output: None,
         responsesapi_client_metadata: None,
+        responsesapi_client_metadata_patch: None,
         additional_context: None,
         environments: None,
         cwd: None,

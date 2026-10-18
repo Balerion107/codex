@@ -17,7 +17,6 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::call_trace;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolRouter;
-use crate::tools::router::tool_log_payload;
 use codex_memories_read::citations::parse_memory_citation;
 use codex_memories_read::citations::thread_ids_from_memory_citation;
 use codex_protocol::error::CodexErr;
@@ -67,7 +66,7 @@ pub(crate) fn raw_assistant_output_text_from_item(item: &ResponseItem) -> Option
         let combined = content
             .iter()
             .filter_map(|ci| match ci {
-                codex_protocol::models::ContentItem::OutputText { text } => Some(text.as_str()),
+                codex_protocol::models::ContentItem::OutputText { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<String>();
@@ -292,7 +291,7 @@ pub(crate) async fn finalize_non_tool_response_item(
                     Some(combined)
                 };
                 let defers_mailbox_delivery_to_next_turn =
-                    !matches!(agent_message.phase, Some(MessagePhase::Commentary))
+                    matches!(agent_message.phase, Some(MessagePhase::FinalAnswer) | None)
                         && last_agent_message.is_some();
                 (
                     agent_message.memory_citation.clone(),
@@ -338,12 +337,10 @@ pub(crate) async fn handle_output_item_done(
                 )
                 .await;
 
-            let payload_preview = tool_log_payload(&call.payload, &call.direct_source());
             tracing::info!(
                 thread_id = %ctx.sess.thread_id,
-                "ToolCall: {} {}",
+                "ToolCall: {}",
                 call.tool_name,
-                payload_preview
             );
 
             record_completed_response_item(ctx.sess.as_ref(), ctx.step_context.as_ref(), &item)
@@ -441,28 +438,8 @@ pub(crate) async fn handle_non_tool_response_item(
     item: &ResponseItem,
     plan_mode: bool,
 ) -> Option<TurnItem> {
-    let item_type = match item {
-        ResponseItem::AdditionalTools { .. } => "additional_tools",
-        ResponseItem::Message { .. } => "message",
-        ResponseItem::AgentMessage { .. } => "agent_message",
-        ResponseItem::Reasoning { .. } => "reasoning",
-        ResponseItem::LocalShellCall { .. } => "local_shell_call",
-        ResponseItem::FunctionCall { .. } => "function_call",
-        ResponseItem::ToolSearchCall { .. } => "tool_search_call",
-        ResponseItem::FunctionCallOutput { .. } => "function_call_output",
-        ResponseItem::CustomToolCall { .. } => "custom_tool_call",
-        ResponseItem::CustomToolCallOutput { .. } => "custom_tool_call_output",
-        ResponseItem::ToolSearchOutput { .. } => "tool_search_output",
-        ResponseItem::WebSearchCall { .. } => "web_search_call",
-        ResponseItem::ImageGenerationCall { .. } => "image_generation_call",
-        ResponseItem::Compaction { .. } => "compaction",
-        ResponseItem::ConfigurationUpdate { .. } => "configuration_update",
-        ResponseItem::CompactionTrigger { .. } => "compaction_trigger",
-        ResponseItem::ContextCompaction { .. } => "context_compaction",
-        ResponseItem::Other => "other",
-    };
     debug!(
-        item_type,
+        item_type = item.item_type(),
         item_id = item.id().map(ResponseItemId::as_str),
         "Output item"
     );
@@ -535,7 +512,7 @@ fn completed_item_defers_mailbox_delivery_to_next_turn(
 ) -> bool {
     match item {
         ResponseItem::Message { role, phase, .. } => {
-            if role != "assistant" || matches!(phase, Some(MessagePhase::Commentary)) {
+            if role != "assistant" || !matches!(phase, Some(MessagePhase::FinalAnswer) | None) {
                 return false;
             }
             // Treat `None` like final-answer text so untagged providers default

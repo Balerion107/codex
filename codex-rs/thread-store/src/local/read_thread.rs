@@ -199,7 +199,7 @@ fn reject_paginated_history(thread: &StoredThread, include_history: bool) -> Thr
     Ok(())
 }
 
-async fn resolve_requested_rollout_path(
+pub(super) async fn resolve_requested_rollout_path(
     store: &LocalThreadStore,
     rollout_path: std::path::PathBuf,
 ) -> ThreadStoreResult<std::path::PathBuf> {
@@ -227,17 +227,39 @@ async fn resolve_requested_rollout_path(
         }
         _ => {}
     }
-    let Some(path) = codex_rollout::existing_rollout_path(path.as_path()).await else {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: format!(
-                "failed to resolve rollout path `{}`: file does not exist",
-                path.display()
-            ),
-        });
-    };
-    std::fs::canonicalize(path.as_path()).map_err(|err| ThreadStoreError::InvalidRequest {
-        message: format!("failed to resolve rollout path `{}`: {err}", path.display()),
-    })
+    // Compression can replace the physical file after lookup, before canonicalization.
+    // Resolve again from the requested path so either representation remains usable.
+    let mut retries_remaining = 3;
+    loop {
+        let resolved_path = match codex_rollout::existing_rollout_path(path.as_path()).await {
+            Some(path) => path,
+            None if retries_remaining > 0 => {
+                retries_remaining -= 1;
+                continue;
+            }
+            None => {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "failed to resolve rollout path `{}`: file does not exist",
+                        path.display()
+                    ),
+                });
+            }
+        };
+        match std::fs::canonicalize(&resolved_path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && retries_remaining > 0 => {
+                retries_remaining -= 1;
+            }
+            result => {
+                return result.map_err(|err| ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "failed to resolve rollout path `{}`: {err}",
+                        resolved_path.display()
+                    ),
+                });
+            }
+        }
+    }
 }
 
 async fn attach_history_if_requested(
@@ -253,8 +275,14 @@ async fn attach_history_if_requested(
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
+    let before = super::history_revision::read(&path).await;
     let items = load_history_items(&path).await?;
-    thread.history = Some(StoredThreadHistory { thread_id, items });
+    let after = super::history_revision::read(&path).await;
+    thread.history = Some(StoredThreadHistory {
+        revision: before.filter(|revision| Some(revision) == after.as_ref()),
+        thread_id,
+        items,
+    });
     Ok(())
 }
 

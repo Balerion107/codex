@@ -1,3 +1,4 @@
+use super::prompt::GuardianTranscriptHistory;
 use super::*;
 use crate::config::Config;
 use crate::config::ConfigOverrides;
@@ -31,7 +32,7 @@ use codex_guardian_context::ConversationTranscriptEntryKind;
 use codex_guardian_reviewer::guardian_output_contract_prompt;
 use codex_history::RolloutItem;
 use codex_model_provider::create_model_provider;
-use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_4_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_5_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
@@ -40,6 +41,7 @@ use codex_network_proxy::NetworkProxyConfig;
 use codex_prompts::GuardianPolicyInstructions;
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::ThreadId;
+use codex_protocol::TranscriptFormat;
 use codex_protocol::approvals::GuardianAssessmentAction;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::config_types::ReasoningSummary;
@@ -60,6 +62,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GuardianAssessmentStatus;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol_test_support::ContentItemTestExt;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
@@ -252,6 +255,8 @@ async fn seed_guardian_parent_history(session: &Arc<Session>, turn: &Arc<TurnCon
             turn.model_info(),
             &[
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText {
@@ -262,6 +267,8 @@ async fn seed_guardian_parent_history(session: &Arc<Session>, turn: &Arc<TurnCon
                     internal_chat_message_metadata_passthrough: None,
                 },
                 ResponseItem::FunctionCall {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     name: "gh_repo_view".to_string(),
                     namespace: None,
@@ -281,9 +288,13 @@ async fn seed_guardian_parent_history(session: &Arc<Session>, turn: &Arc<TurnCon
                     internal_chat_message_metadata_passthrough: None,
                 },
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "assistant".to_string(),
                     content: vec![ContentItem::OutputText {
+                        annotations: None,
+                        logprobs: None,
                         text: "The repo is public; I now need approval to push the docs fix."
                             .to_string(),
                     }],
@@ -300,7 +311,9 @@ fn response_item_contains_message_text(item: &ResponseItem, needle: &str) -> boo
         return false;
     };
     content.iter().any(|item| match item {
-        ContentItem::InputText { text } | ContentItem::OutputText { text } => text.contains(needle),
+        ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
+            text.contains(needle)
+        }
         ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => false,
     })
 }
@@ -397,7 +410,7 @@ async fn build_guardian_prompt_prefers_retry_reason_over_approval_reason() -> an
 
     let prompt = build_guardian_prompt_items_with_parent_turn(
         session.as_ref(),
-        session.conversation_history_snapshot().await.as_ref(),
+        GuardianTranscriptHistory::Retained(session.conversation_history_snapshot().await.as_ref()),
         Some(&context),
         ApprovalRequestReasons {
             approval: Some("A policy rule requires approval.".to_string()),
@@ -439,7 +452,7 @@ async fn build_guardian_prompt_truncates_oversized_approval_reason() -> anyhow::
 
     let prompt = build_guardian_prompt_items_with_parent_turn(
         session.as_ref(),
-        session.conversation_history_snapshot().await.as_ref(),
+        GuardianTranscriptHistory::Retained(session.conversation_history_snapshot().await.as_ref()),
         Some(&context),
         ApprovalRequestReasons {
             approval: Some(approval_reason),
@@ -534,7 +547,7 @@ async fn build_guardian_prompt_includes_parent_turn_denied_reads() -> anyhow::Re
 
     let prompt = build_guardian_prompt_items_with_parent_turn(
         session.as_ref(),
-        session.conversation_history_snapshot().await.as_ref(),
+        GuardianTranscriptHistory::Retained(session.conversation_history_snapshot().await.as_ref()),
         Some(&context),
         ApprovalRequestReasons {
             approval: None,
@@ -625,6 +638,13 @@ async fn approval_permissions_use_the_owning_environment() -> anyhow::Result<()>
         port: 443,
         trigger: None,
     };
+    assert_eq!(
+        super::permissions::for_environment(&context, /*environment_id*/ None)?,
+        super::permissions::for_environment(
+            &context,
+            Some(codex_exec_server::LOCAL_ENVIRONMENT_ID),
+        )?,
+    );
     let requests = [
         network_request("secondary"),
         network_request("windows"),
@@ -637,16 +657,6 @@ async fn approval_permissions_use_the_owning_environment() -> anyhow::Result<()>
             cwd: cwd.clone().into(),
             tty: true,
             sandbox_permissions: SandboxPermissions::UseDefault,
-            additional_permissions: None,
-        },
-        #[cfg(unix)]
-        GuardianApprovalRequest::Execve {
-            id: "shell".to_string(),
-            environment_id: "secondary".to_string(),
-            source: codex_protocol::approvals::GuardianCommandSource::UnifiedExec,
-            program: "cat".to_string(),
-            argv: Vec::new(),
-            cwd,
             additional_permissions: None,
         },
     ];
@@ -664,7 +674,9 @@ async fn approval_permissions_use_the_owning_environment() -> anyhow::Result<()>
         let is_windows = request.target_environment_id() == Some("windows");
         let prompt = build_guardian_prompt_items_with_parent_turn(
             &session,
-            session.conversation_history_snapshot().await.as_ref(),
+            GuardianTranscriptHistory::Retained(
+                session.conversation_history_snapshot().await.as_ref(),
+            ),
             Some(&context),
             ApprovalRequestReasons::default(),
             request,
@@ -674,7 +686,7 @@ async fn approval_permissions_use_the_owning_environment() -> anyhow::Result<()>
         .await?;
         let text = guardian_prompt_text(&prompt.context.into_user_inputs()?);
         assert!(text.contains(&format!(
-            "For this action on environment {environment_id:?}"
+            "The active permission profile for environment {environment_id:?}"
         )));
         if is_windows {
             assert!(
@@ -737,6 +749,7 @@ async fn guardian_mcp_uses_thread_permissions_for_an_unavailable_captured_enviro
     selection.config = codex_protocol::protocol::EnvironmentConfigState::Failed("offline".into());
     let captured = crate::environment_selection::TurnEnvironmentSnapshot {
         environments: vec![TurnEnvironmentState::Failed {
+            required_skills: Vec::new(),
             selection,
             error: "offline".into(),
         }],
@@ -749,7 +762,7 @@ async fn guardian_mcp_uses_thread_permissions_for_an_unavailable_captured_enviro
     );
     let prompt = build_guardian_prompt_items_with_parent_turn(
         &session,
-        session.conversation_history_snapshot().await.as_ref(),
+        GuardianTranscriptHistory::Retained(session.conversation_history_snapshot().await.as_ref()),
         Some(&context),
         ApprovalRequestReasons::default(),
         guardian_mcp_request("server", "tool"),
@@ -773,6 +786,8 @@ async fn build_guardian_prompt_delta_mode_preserves_original_numbering() -> anyh
             turn.model_info(),
             &[
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText {
@@ -782,9 +797,13 @@ async fn build_guardian_prompt_delta_mode_preserves_original_numbering() -> anyh
                     internal_chat_message_metadata_passthrough: None,
                 },
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "assistant".to_string(),
                     content: vec![ContentItem::OutputText {
+                        annotations: None,
+                        logprobs: None,
                         text: "I need approval for the second push.".to_string(),
                     }],
                     phase: None,
@@ -914,6 +933,8 @@ async fn build_guardian_prompt_stale_delta_version_falls_back_to_full_prompt() -
         .replace_history(
             vec![
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText {
@@ -923,9 +944,13 @@ async fn build_guardian_prompt_stale_delta_version_falls_back_to_full_prompt() -
                     internal_chat_message_metadata_passthrough: None,
                 },
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "assistant".to_string(),
                     content: vec![ContentItem::OutputText {
+                        annotations: None,
+                        logprobs: None,
                         text: "Compacted summary of earlier guardian context.".to_string(),
                     }],
                     phase: None,
@@ -941,6 +966,8 @@ async fn build_guardian_prompt_stale_delta_version_falls_back_to_full_prompt() -
             turn.model_info(),
             &[
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText {
@@ -950,9 +977,13 @@ async fn build_guardian_prompt_stale_delta_version_falls_back_to_full_prompt() -
                     internal_chat_message_metadata_passthrough: None,
                 },
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "assistant".to_string(),
                     content: vec![ContentItem::OutputText {
+                        annotations: None,
+                        logprobs: None,
                         text: "I need approval for the post-compaction push.".to_string(),
                     }],
                     phase: None,
@@ -1019,6 +1050,8 @@ fn collect_guardian_transcript_entries(
 fn collect_guardian_transcript_entries_skips_contextual_user_messages() {
     let items = vec![
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -1028,9 +1061,13 @@ fn collect_guardian_transcript_entries_skips_contextual_user_messages() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: "hello".to_string(),
             }],
             phase: None,
@@ -1045,8 +1082,9 @@ fn collect_guardian_transcript_entries_skips_contextual_user_messages() {
         entries[0],
         ConversationTranscriptEntry {
             kind: ConversationTranscriptEntryKind::ProtectedAssistant,
-            text: "hello".to_string(),
+            content: codex_guardian_context::TranscriptContent::Text("hello".to_string()),
             original_bytes: "hello".len(),
+            retained_source: None,
         }
     );
 }
@@ -1055,6 +1093,8 @@ fn collect_guardian_transcript_entries_skips_contextual_user_messages() {
 fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
     let mut items = vec![
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -1064,6 +1104,8 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "read_file".to_string(),
             namespace: None,
@@ -1083,9 +1125,13 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: "I need to push a fix".to_string(),
             }],
             phase: None,
@@ -1100,16 +1146,20 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
         entries[1],
         ConversationTranscriptEntry {
             kind: ConversationTranscriptEntryKind::ToolCall("tool read_file call".to_string()),
-            text: "{\"path\":\"README.md\"}".to_string(),
+            content: codex_guardian_context::TranscriptContent::Text(
+                "{\"path\":\"README.md\"}".to_string()
+            ),
             original_bytes: "{\"path\":\"README.md\"}".len(),
+            retained_source: None,
         }
     );
     assert_eq!(
         entries[2],
         ConversationTranscriptEntry {
             kind: ConversationTranscriptEntryKind::ToolOutput("tool read_file result".to_string()),
-            text: "repo is public".to_string(),
+            content: codex_guardian_context::TranscriptContent::Text("repo is public".to_string()),
             original_bytes: "repo is public".len(),
+            retained_source: None,
         }
     );
     if let ResponseItem::FunctionCall { namespace, .. } = &mut items[1] {
@@ -1136,8 +1186,11 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
                 kind: ConversationTranscriptEntryKind::NodeReplToolOutput(
                     "tool read_file result".to_string()
                 ),
-                text: guardian_truncate_text(&oversized_result, token_cap).0,
+                content: codex_guardian_context::TranscriptContent::Text(
+                    guardian_truncate_text(&oversized_result, token_cap).0
+                ),
                 original_bytes: oversized_result.len(),
+                retained_source: None,
             }
         );
         assert_eq!(entries.len(), 4);
@@ -1147,7 +1200,10 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
                 vec![
                     "[1] user: check the repo".to_string(),
                     "[2] tool read_file call: {\"path\":\"README.md\"}".to_string(),
-                    format!("[3] tool read_file result: {}", entries[2].text),
+                    format!(
+                        "[3] tool read_file result: {}",
+                        guardian_truncate_text(&oversized_result, token_cap).0
+                    ),
                     "[4] assistant: I need to push a fix".to_string(),
                 ],
                 None,
@@ -1271,7 +1327,7 @@ async fn build_guardian_prompt_items_keeps_required_node_repl_reviews_generic() 
 
     let prompt = build_guardian_prompt_items_with_parent_turn(
         session.as_ref(),
-        session.conversation_history_snapshot().await.as_ref(),
+        GuardianTranscriptHistory::Retained(session.conversation_history_snapshot().await.as_ref()),
         Some(&context),
         ApprovalRequestReasons {
             approval: None,
@@ -1310,7 +1366,9 @@ async fn build_guardian_prompt_items_keeps_other_requests_generic() -> anyhow::R
     ] {
         let prompt = build_guardian_prompt_items_with_parent_turn(
             session.as_ref(),
-            session.conversation_history_snapshot().await.as_ref(),
+            GuardianTranscriptHistory::Retained(
+                session.conversation_history_snapshot().await.as_ref(),
+            ),
             Some(&context),
             ApprovalRequestReasons::default(),
             request,
@@ -1501,6 +1559,10 @@ fn guardian_write_stdin_preserves_input_and_foreign_cwd(
             guardian_request_turn_id(&action, "current-turn"),
         ),
         (Some("terminal-open"), "current-turn"),
+    );
+    assert_eq!(
+        ReviewAction::from(action).tool_call_id.as_deref(),
+        Some("terminal-write")
     );
     Ok(())
 }
@@ -1743,6 +1805,8 @@ fn build_guardian_transcript_reserves_separate_budget_for_tool_evidence() {
     ]
     .into_iter()
     .map(|(role, text)| ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: role.to_string(),
         content: vec![ContentItem::InputText {
@@ -1753,6 +1817,8 @@ fn build_guardian_transcript_reserves_separate_budget_for_tool_evidence() {
     })
     .collect::<Vec<_>>();
     items.extend((0..12).map(|index| ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
         id: None,
         name: format!("tool_{index}"),
         namespace: None,
@@ -1796,6 +1862,8 @@ fn build_guardian_transcript_preserves_recent_tool_context_when_user_history_is_
     let repeated = "authorization ".repeat(6_000);
     let mut items = (0..8)
         .map(|_| ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -1807,6 +1875,8 @@ fn build_guardian_transcript_preserves_recent_tool_context_when_user_history_is_
         .collect::<Vec<_>>();
     items.extend([
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "shell".to_string(),
             namespace: None,
@@ -1862,7 +1932,7 @@ enum GuardianTestCatalog {
 #[test_case::test_case(None; "captured_policy")]
 #[test_case::test_case(Some("configured policy wins"); "configured_policy")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_reuse_respects_effective_policy_and_personality(
+async fn guardian_reuse_respects_effective_policy_and_personality_opt_out(
     configured_policy: Option<&str>,
 ) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1870,7 +1940,7 @@ async fn guardian_reuse_respects_effective_policy_and_personality(
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
         &server,
-        (0..3)
+        (0..4)
             .map(|index| {
                 sse(vec![
                     ev_response_created(&format!("review-{index}")),
@@ -1916,9 +1986,16 @@ async fn guardian_reuse_respects_effective_policy_and_personality(
         .policy = Some("changed action policy".to_string());
     let mut different_personality = changed_policy.clone();
     different_personality.personality = Some(codex_protocol::config_types::Personality::Pragmatic);
-    for (index, context) in [captured, changed_policy, different_personality]
-        .into_iter()
-        .enumerate()
+    let mut omit_personality = different_personality.clone();
+    omit_personality.personality = Some(codex_protocol::config_types::Personality::None);
+    for (index, context) in [
+        captured,
+        changed_policy,
+        different_personality,
+        omit_personality,
+    ]
+    .into_iter()
+    .enumerate()
     {
         let (outcome, _) = run_guardian_review_session_for_test(
             Arc::clone(&session),
@@ -1932,7 +2009,7 @@ async fn guardian_reuse_respects_effective_policy_and_personality(
         assert!(matches!(outcome, GuardianReviewOutcome::Completed(_)));
     }
     let requests = responses.requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     let contract = guardian_output_contract_prompt();
     for (request, policy) in requests
         .iter()
@@ -1949,7 +2026,8 @@ async fn guardian_reuse_respects_effective_policy_and_personality(
         .map(|request| request.body_json()["client_metadata"]["thread_id"].clone())
         .collect::<Vec<_>>();
     assert_eq!(thread_ids[0] == thread_ids[1], configured_policy.is_some());
-    assert_ne!(thread_ids[1], thread_ids[2]);
+    assert_eq!(thread_ids[1], thread_ids[2]);
+    assert_ne!(thread_ids[2], thread_ids[3]);
     Ok(())
 }
 
@@ -2242,6 +2320,8 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
             turn.as_ref(),
             turn.model_info(),
             &[ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -2528,6 +2608,8 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
             turn.model_info(),
             &[
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText {
@@ -2537,9 +2619,13 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
                     internal_chat_message_metadata_passthrough: None,
                 },
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "assistant".to_string(),
                     content: vec![ContentItem::OutputText {
+                        annotations: None,
+                        logprobs: None,
                         text: "I need approval for the second docs fix.".to_string(),
                     }],
                     phase: None,
@@ -2615,6 +2701,8 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
                     internal_chat_message_metadata_passthrough: None,
                 },
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText {
@@ -2624,9 +2712,13 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
                     internal_chat_message_metadata_passthrough: None,
                 },
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "assistant".to_string(),
                     content: vec![ContentItem::OutputText {
+                        annotations: None,
+                        logprobs: None,
                         text: "I need approval for the third docs fix.".to_string(),
                     }],
                     phase: None,
@@ -2636,9 +2728,10 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
             .into_iter()
             .map(codex_history::ResponseItemEnvelope::new)
             .collect(),
-            /*reference_context_item*/ None,
-            /*world_state_baseline*/ None,
+            turn.to_turn_context_item(),
+            crate::context::world_state::WorldStateSnapshot::default(),
             crate::compact::CompactedHistoryMetadata {
+                input_goal_ids: Default::default(),
                 message: String::new(),
                 window_number,
                 window_ids,
@@ -2674,6 +2767,8 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
     session
         .replace_history(
             vec![ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -2938,6 +3033,7 @@ async fn guardian_reused_trunk_ignores_stale_prior_turn_completion() -> anyhow::
         .send_trunk_event_raw_for_test(Event {
             id: "stale-turn".to_string(),
             msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
                 turn_id: "stale-turn".to_string(),
                 started_at: None,
                 last_agent_message: Some(
@@ -3431,7 +3527,8 @@ async fn guardian_review_routes_required_actions(
         | RequiredGuardianReview::LiveManagedModelWithGuardianV2 => {
             Arc::make_mut(&mut context.model_info).slug = "required-action-model".to_string();
             // The admitted turn has neither this model nor the new requirement.
-            let mut config = session.get_config().await.as_ref().clone();
+            let current_config = session.get_config().await;
+            let mut config = current_config.as_ref().clone();
             let requirements = codex_config::ConfigRequirements {
                 auto_review_required_models: Some(Sourced::new(
                     std::collections::BTreeSet::from([context.model_info.slug.clone()]),
@@ -3448,7 +3545,7 @@ async fn guardian_review_routes_required_actions(
                 requirements,
                 config.config_layer_stack.requirements_toml().clone(),
             )?;
-            session.refresh_mcp_config(config).await;
+            let _ = session.refresh_mcp_config(current_config, config).await;
             (
                 guardian_exec_command_request("shell-live-managed-model"),
                 ApprovalRequestReasons::default(),
@@ -3553,6 +3650,14 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
                     ev_completed("resp-guardian-4"),
                 ]),
             }],
+            vec![StreamingSseChunk {
+                gate: None,
+                body: sse(vec![
+                    ev_response_created("resp-guardian-5"),
+                    ev_assistant_message("msg-guardian-5", &second_assessment),
+                    ev_completed("resp-guardian-5"),
+                ]),
+            }],
         ])
         .await;
 
@@ -3594,6 +3699,8 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
                 turn.as_ref(), turn.model_info(),
                 &[
                     ResponseItem::Message {
+                        status: None,
+                        encrypted_content: None,
                         id: None,
                         role: "user".to_string(),
                         content: vec![ContentItem::InputText {
@@ -3602,9 +3709,13 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
                         phase: None,
                         internal_chat_message_metadata_passthrough: None,},
                     ResponseItem::Message {
+                        status: None,
+                        encrypted_content: None,
                         id: None,
                         role: "assistant".to_string(),
                         content: vec![ContentItem::OutputText {
+                            annotations: None,
+                            logprobs: None,
                             text: "I need approval to run git diff.".to_string(),
                         }],
                         phase: None,
@@ -3636,6 +3747,7 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
             tty: false,
         };
 
+        let second_action = super::approval_request::format_guardian_action_pretty(&second_request)?;
         let session_for_second = Arc::clone(&session);
         let turn_for_second = Arc::clone(&turn);
         let mut second_review = tokio::spawn(async move {
@@ -3670,6 +3782,8 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
                 turn.as_ref(), turn.model_info(),
                 &[
                     ResponseItem::Message {
+                        status: None,
+                        encrypted_content: None,
                         id: None,
                         role: "user".to_string(),
                         content: vec![ContentItem::InputText {
@@ -3678,9 +3792,13 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
                         phase: None,
                         internal_chat_message_metadata_passthrough: None,},
                     ResponseItem::Message {
+                        status: None,
+                        encrypted_content: None,
                         id: None,
                         role: "assistant".to_string(),
                         content: vec![ContentItem::OutputText {
+                            annotations: None,
+                            logprobs: None,
                             text: "I need approval to push after the diff check.".to_string(),
                         }],
                         phase: None,
@@ -3760,9 +3878,15 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
         gate_tx
             .send(())
             .expect("second guardian review gate should still be open");
-        // The later user input revokes the in-flight trunk review's authorization version.
-        assert_eq!(second_review.await?, ReviewDecision::Abort);
-        let feedback = codex_feedback::guardian_review_failures(&[session.thread_id()])
+        // The later user input requires a fresh review of the same pending action.
+        assert_eq!(second_review.await?, ReviewDecision::Approved);
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 5);
+        let refreshed_request_body = serde_json::from_slice::<serde_json::Value>(&requests[4])?;
+        let refreshed_user_message = last_user_message_text_from_body(&refreshed_request_body);
+        assert!(refreshed_user_message.contains("Now inspect whether pushing is safe."));
+        assert!(refreshed_user_message.contains(&second_action));
+        let feedback = codex_feedback::guardian_review_failures(session.state_db().as_deref(), &[session.thread_id()]).await
             .attachment
             .expect("failed ephemeral review survives cleanup and subsequent allowed reviews");
         let record: serde_json::Value = serde_json::from_slice(&feedback.buffer)?;
@@ -4024,12 +4148,14 @@ async fn guardian_review_session_config_isolates_parent_customizations() {
         guardian_config.base_instructions,
         Some(
             GuardianPolicyInstructions::new(
+                TranscriptFormat::Line,
                 defaults.policy,
                 "",
                 defaults.policy_template,
                 guardian_output_contract_prompt(),
             )
             .render()
+            .expect_text()
         )
     );
 }
@@ -4065,7 +4191,7 @@ async fn guardian_review_session_config_allows_pinned_disabled_feature() {
 }
 
 #[tokio::test]
-async fn guardian_review_session_config_keeps_bedrock_provider_for_bedrock_gpt_5_4() {
+async fn guardian_review_session_config_keeps_bedrock_provider_for_bedrock_gpt_5_5() {
     let mut parent_config = test_config().await;
     parent_config.model_provider_id = AMAZON_BEDROCK_PROVIDER_ID.to_string();
     parent_config.model_provider =
@@ -4074,7 +4200,7 @@ async fn guardian_review_session_config_keeps_bedrock_provider_for_bedrock_gpt_5
     let guardian_config = build_guardian_review_session_config_for_test(
         crate::guardian::test_host::build_reviewer_config(&parent_config).expect("reviewer config"),
         /*live_network_config*/ None,
-        AMAZON_BEDROCK_GPT_5_4_MODEL_ID,
+        AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
         Some(ReasoningEffort::Low),
         ReasoningSummary::default(),
         /*personality*/ None,
@@ -4093,7 +4219,7 @@ async fn guardian_review_session_config_keeps_bedrock_provider_for_bedrock_gpt_5
             guardian_config.model_provider,
         ),
         (
-            Some(AMAZON_BEDROCK_GPT_5_4_MODEL_ID.to_string()),
+            Some(AMAZON_BEDROCK_GPT_5_5_MODEL_ID.to_string()),
             AMAZON_BEDROCK_PROVIDER_ID.to_string(),
             expected_model_provider,
         )
@@ -4144,6 +4270,7 @@ async fn guardian_review_session_config_uses_requirements_guardian_policy_config
         guardian_config.base_instructions,
         Some(
             GuardianPolicyInstructions::new(
+                TranscriptFormat::Line,
                 "Use the workspace-managed guardian policy.",
                 "",
                 ResolvedModelMessages::bundled()
@@ -4152,6 +4279,7 @@ async fn guardian_review_session_config_uses_requirements_guardian_policy_config
                 guardian_output_contract_prompt(),
             )
             .render()
+            .expect_text()
         )
     );
 }

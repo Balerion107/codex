@@ -3,18 +3,21 @@
 //! Mutable cells refresh each frame, then share that frame's layout across measurement and paint.
 //! Stable cells also invalidate when animation ticks, syntax themes, or terminal colors change.
 
+use crate::history_cell::ActivityDisclosure;
+use crate::key_hint::ShortcutHint;
+use crate::keymap::KeymapContext;
 use std::sync::Weak;
 
 use super::*;
 
 const MAX_CACHED_ENTRIES: usize = 64;
-const MAX_CACHED_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CACHED_LAYOUT_BYTES: usize = 8 * 1024 * 1024;
 
 /// The selected activity presentation and any live content that follows it.
 pub(crate) struct ActivityTranscriptLines {
     pub(crate) activity: Vec<HyperlinkLine>,
     pub(crate) auxiliary: Vec<HyperlinkLine>,
-    pub(crate) has_hidden_details: bool,
+    pub(crate) disclosure: Option<ActivityDisclosure>,
 }
 
 /// Keep disclosure controls outside selectable source without rendering hidden details.
@@ -22,8 +25,9 @@ pub(super) fn activity_layout(
     mut lines: ActivityTranscriptLines,
     width: u16,
     expanded: bool,
+    shortcut: Option<ShortcutHint>,
 ) -> TextLayout {
-    let has_details = !lines.activity.is_empty() && (expanded || lines.has_hidden_details);
+    let has_details = !lines.activity.is_empty() && (expanded || lines.disclosure.is_some());
     let source_offset = (!lines.auxiliary.is_empty())
         .then(|| TextLayout::new(lines.activity.clone(), width).text().len());
     lines.activity.extend(lines.auxiliary);
@@ -31,12 +35,23 @@ pub(super) fn activity_layout(
     if !has_details {
         return layout;
     }
-    let label = if expanded {
-        "− Show less"
-    } else {
-        "+ Show details"
-    }
-    .to_owned();
+    let label = match (expanded, lines.disclosure) {
+        (true, Some(ActivityDisclosure::OutputLines(_))) => "− Show less".to_owned(),
+        (true, Some(ActivityDisclosure::Generic) | None) => "− Hide details".to_owned(),
+        (false, Some(ActivityDisclosure::OutputLines(count))) => {
+            let noun = if count == 1 { "line" } else { "lines" };
+            let mut label = format!("+ {count} {noun}");
+            if let Some(shortcut) = shortcut {
+                let hint = format!(" ({} to expand)", shortcut.display_label());
+                let indent = usize::from(width / 4).min(/*other*/ 4);
+                if Line::from(format!("{label}{hint}")).width() + indent <= usize::from(width) {
+                    label.push_str(&hint);
+                }
+            }
+            label
+        }
+        (false, Some(ActivityDisclosure::Generic) | None) => "+ Show details".to_owned(),
+    };
     match source_offset {
         Some(offset) => layout.with_disclosure_control_at(label, offset),
         None => layout.with_disclosure_control(label),
@@ -56,6 +71,7 @@ struct RenderState {
     foreground: Option<(u8, u8, u8)>,
     background: Option<(u8, u8, u8)>,
     color_level: crate::terminal_palette::StdoutColorLevel,
+    cell_size: Option<(u32, u32)>,
 }
 
 struct CachedLayout {
@@ -70,8 +86,11 @@ struct CachedLayout {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct CellPresentation {
     separated: bool,
+    turn_tip_space: bool,
     expanded: bool,
     disclosure: bool,
+    detailed: bool,
+    image_protocol: Option<crate::pets::ImageProtocol>,
 }
 
 impl TranscriptView {
@@ -85,6 +104,20 @@ impl TranscriptView {
         if index > cells.len() {
             return None;
         }
+        let key = self.entry_key(cells, index);
+        if let Some(layout) = self.search.match_layout(key) {
+            return Some(layout);
+        }
+        self.base_layout(cells, index)
+    }
+
+    /// Resolve manual disclosure and retained revisions, without Find's temporary expansion.
+    /// Call with the snapshot's cells, if present.
+    pub(super) fn base_layout(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
+        index: usize,
+    ) -> Option<Arc<TextLayout>> {
         let key = self.entry_key(cells, index);
         if let Some(layout) = self
             .snapshot()
@@ -103,6 +136,15 @@ impl TranscriptView {
         &mut self,
         cells: &[Arc<dyn HistoryCell>],
         index: usize,
+    ) -> Option<Arc<TextLayout>> {
+        self.entry_layout(cells, index, self.detailed)
+    }
+
+    pub(super) fn entry_layout(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
+        index: usize,
+        full_content: bool,
     ) -> Option<Arc<TextLayout>> {
         let Some(cell) = cells.get(index) else {
             if index != cells.len() {
@@ -125,22 +167,32 @@ impl TranscriptView {
         {
             return Some(Arc::new(TextLayout::new(Vec::new(), width)));
         }
-        let detailed = self.detailed;
         let mode = self.mode;
         let ids = cell.activity_ids();
-        let disclosure = !detailed && mode == HistoryRenderMode::Rich && !ids.is_empty();
-        let expanded = disclosure && self.disclosure.is_expanded(&ids);
-        if expanded {
+        let disclosure = !self.detailed && mode == HistoryRenderMode::Rich && !ids.is_empty();
+        let manually_expanded = self.disclosure.is_expanded(&ids);
+        let reveal_image = ids.is_empty() || manually_expanded || self.detailed;
+        let expanded = disclosure && (full_content || manually_expanded);
+        if manually_expanded {
             self.disclosure.expanded.extend(ids);
         }
         let separated = index > 0 && !cell.is_stream_continuation();
         let presentation = CellPresentation {
             separated,
+            turn_tip_space: self.turn_tip_key == Some(EntryKey::cell(cell)),
             expanded,
             disclosure,
+            detailed: full_content,
+            image_protocol: self
+                .image_protocol
+                .filter(|_| mode == HistoryRenderMode::Rich && reveal_image),
         };
+        let shortcut = self
+            .disclosure
+            .keymap
+            .primary_hint(KeymapContext::Global, "open_transcript");
         Some(self.cache.get(cell, width, presentation, || {
-            if disclosure {
+            let mut layout = if disclosure {
                 activity_layout(
                     ActivityTranscriptLines {
                         activity: if expanded {
@@ -149,16 +201,31 @@ impl TranscriptView {
                             cell.compact_hyperlink_lines(width)
                         },
                         auxiliary: Vec::new(),
-                        has_hidden_details: cell.has_hidden_activity_details(width),
+                        disclosure: cell.activity_disclosure(width),
                     },
                     width,
                     expanded,
+                    shortcut,
                 )
-            } else if detailed || mode == HistoryRenderMode::Rich {
-                TextLayout::new(cell.retained_hyperlink_lines(width, detailed), width)
             } else {
-                TextLayout::new(cell.display_hyperlink_lines_for_mode(width, mode), width)
+                TextLayout::new(
+                    crate::history_cell::fullscreen_session_lines(
+                        cell.as_ref(),
+                        width,
+                        full_content,
+                        mode,
+                    ),
+                    width,
+                )
+            };
+            if let Some(protocol) = presentation.image_protocol
+                && let Some(path) = cell.image_path()
+            {
+                layout.image =
+                    crate::transcript_image::TranscriptImage::load(path.as_path(), width, protocol)
+                        .map(Arc::new);
             }
+            layout
         }))
     }
 }
@@ -171,6 +238,7 @@ impl LayoutCache {
             foreground: crate::terminal_palette::default_fg(),
             background: crate::terminal_palette::default_bg(),
             color_level: crate::terminal_palette::stdout_color_level(),
+            cell_size: crate::transcript_image::terminal_cell_size(),
         };
         if self.render_state.as_ref() != Some(&state) {
             self.entries.clear();
@@ -203,8 +271,13 @@ impl LayoutCache {
             return layout;
         }
         let layout = render();
-        let layout = Arc::new(if presentation.separated {
+        let layout = if presentation.separated {
             layout.with_leading_separator()
+        } else {
+            layout
+        };
+        let layout = Arc::new(if presentation.turn_tip_space {
+            layout.with_leading_spacer()
         } else {
             layout
         });
@@ -226,16 +299,20 @@ impl LayoutCache {
     }
 
     fn evict(&mut self) {
-        let mut bytes = self
-            .entries
-            .iter()
-            .map(|entry| entry.layout.text().len())
-            .sum::<usize>();
+        let retained_bytes = |entry: &CachedLayout| {
+            entry.layout.text().len()
+                + entry
+                    .layout
+                    .image
+                    .as_ref()
+                    .map_or(0, |image| image.pixels.len())
+        };
+        let mut bytes = self.entries.iter().map(retained_bytes).sum::<usize>();
         // Retain a single oversized entry rather than repeatedly laying it out while visible.
         while self.entries.len() > 1
-            && (self.entries.len() > MAX_CACHED_ENTRIES || bytes > MAX_CACHED_TEXT_BYTES)
+            && (self.entries.len() > MAX_CACHED_ENTRIES || bytes > MAX_CACHED_LAYOUT_BYTES)
         {
-            bytes -= self.entries.remove(/*index*/ 0).layout.text().len();
+            bytes -= retained_bytes(&self.entries.remove(/*index*/ 0));
         }
     }
 }

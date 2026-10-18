@@ -7,6 +7,7 @@ mod tool_policy;
 mod turn_admission;
 mod user_instructions;
 
+pub use session_isolation::IsolatedSessionExtensions;
 pub use session_isolation::SessionIsolation;
 pub use tool_policy::ToolPolicy;
 
@@ -21,8 +22,10 @@ pub use capabilities::ResponseItemInjector;
 pub use codex_context_fragments::ContextualUserFragment;
 pub use codex_mcp::McpProtocolMode;
 pub use codex_mcp::ToolInfo as McpToolInfo;
+pub use codex_protocol::models::ContentItem;
 pub use codex_protocol::models::ContentItemKind;
 pub use codex_protocol::models::ResponseItem;
+pub use codex_protocol::models::input_text;
 pub use codex_protocol::security_risk::SecurityRiskScore;
 pub use codex_tools::ConversationHistory;
 pub use codex_tools::ExtensionTurnItem;
@@ -61,6 +64,8 @@ pub use contributors::PreviousWorldStateSection;
 pub use contributors::PromptFragment;
 pub use contributors::PromptSlot;
 pub use contributors::RenderedWorldStateFragment;
+pub use contributors::SelectedPlugin;
+pub use contributors::SelectedPluginContribution;
 pub use contributors::SelectedPluginIdentity;
 pub use contributors::SelectedPluginSnapshot;
 pub use contributors::SkillInvocationContributor;

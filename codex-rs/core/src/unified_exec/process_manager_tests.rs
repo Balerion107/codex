@@ -1,6 +1,10 @@
 use super::*;
+use crate::shell::Shell;
+use crate::shell::ShellInvocation;
+use crate::shell::ShellType;
 use crate::unified_exec::clamp_yield_time;
 use codex_network_proxy::ManagedNetworkSandboxContext;
+use core_test_support::assert_regex_match;
 use pretty_assertions::assert_eq;
 use tokio::sync::Notify;
 use tokio::time::Duration;
@@ -249,7 +253,11 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     };
     let params = params_for_request(&request);
 
-    assert_eq!(params.process_id.as_str(), "123");
+    assert_regex_match(
+        r"^123-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$",
+        params.process_id.as_str(),
+    );
+    assert_ne!(params.process_id, params_for_request(&request).process_id);
     assert_eq!(params.metadata, None);
     assert_eq!(params.cwd, request.cwd);
     assert!(params.enforce_managed_network);
@@ -347,6 +355,8 @@ async fn output_collection_stays_bounded_across_repeated_drains() {
         output_closed: Arc::clone(&output_closed),
         output_closed_notify: Arc::clone(&output_closed_notify),
         cancellation_token: cancellation_token.clone(),
+        collection_finished: CancellationToken::new(),
+        drain_policy: OutputDrainPolicy::BoundedAfterExit,
     };
 
     let collect = UnifiedExecProcessManager::collect_output_until_deadline(
@@ -405,6 +415,8 @@ async fn output_collection_preserves_omissions_from_drained_buffer() {
         output_closed,
         output_closed_notify,
         cancellation_token,
+        collection_finished: CancellationToken::new(),
+        drain_policy: OutputDrainPolicy::BoundedAfterExit,
     };
 
     let collected = UnifiedExecProcessManager::collect_output_until_deadline(
@@ -454,7 +466,13 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
             "-lc".to_string(),
             "echo before".to_string(),
         ],
-        shell_type: crate::shell::ShellType::Sh,
+        shell: ShellInvocation {
+            shell: Shell {
+                shell_type: ShellType::Sh,
+                shell_path: "sh".into(),
+            },
+            use_login_shell: true,
+        },
         hook_command: "echo before".to_string(),
         process_id: 123,
         yield_time_ms: 1000,
@@ -468,7 +486,6 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
             .primary()
             .cloned()
             .expect("primary environment"),
-        shell_mode: codex_tools::UnifiedExecShellMode::Direct,
         network: None,
         tty: true,
         sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
@@ -482,7 +499,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
     output_buffer.lock().await.push_chunk(b"PARTIAL_TRANSCRIPT");
 
     emit_failed_initial_exec_end_if_unstored(
-        /*process_started_alive*/ false,
+        /*process_stored*/ false,
         Some(codex_protocol::sandbox::SandboxType::WindowsMxc),
         &context,
         &request,

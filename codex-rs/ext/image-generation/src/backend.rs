@@ -5,8 +5,11 @@ use codex_api::ImageResponse;
 use codex_api::ImagesClient;
 use codex_api::ReqwestTransport;
 use codex_api::map_api_error;
+use codex_core::X_CODEX_TURN_METADATA_HEADER;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
 use codex_login::default_client::add_originator_header;
-use codex_login::default_client::create_client;
+use codex_login::default_client::create_transport_for_routes_async;
 use codex_model_provider::SharedModelProvider;
 use codex_protocol::error::CodexErr;
 use http::HeaderMap;
@@ -55,14 +58,20 @@ impl ImageBackendError {
 #[derive(Clone)]
 pub(crate) struct CodexImagesBackend {
     provider: SharedModelProvider,
+    http_client_factory: HttpClientFactory,
     originator: Option<String>,
 }
 
 impl CodexImagesBackend {
     /// Creates a backend that sends image requests through the active model provider.
-    pub(crate) fn new(provider: SharedModelProvider, originator: Option<String>) -> Self {
+    pub(crate) fn new(
+        provider: SharedModelProvider,
+        http_client_factory: HttpClientFactory,
+        originator: Option<String>,
+    ) -> Self {
         Self {
             provider,
+            http_client_factory,
             originator,
         }
     }
@@ -79,11 +88,13 @@ impl CodexImagesBackend {
             .api_auth()
             .await
             .map_err(|err| ImageBackendError::from_message(err.to_string()))?;
-        Ok(ImagesClient::new(
-            ReqwestTransport::from_http_client(create_client()),
-            provider,
-            auth,
-        ))
+        let transport = create_transport_for_routes_async(
+            self.http_client_factory.clone(),
+            ClientRouteClass::Api,
+        )
+        .await
+        .map_err(|err| ImageBackendError::from_message(err.to_string()))?;
+        Ok(ImagesClient::new(transport, provider, auth))
     }
 
     /// Sends a standalone image generation request through the configured Images client.
@@ -91,12 +102,13 @@ impl CodexImagesBackend {
         &self,
         request: ImageGenerationRequest,
         turn_id: &str,
+        codex_turn_metadata: Option<&str>,
     ) -> Result<(ImageResponse, Option<String>), ImageBackendError> {
         self.client()
             .await?
             .generate(
                 &request,
-                image_request_headers(self.originator.as_deref(), turn_id),
+                image_request_headers(self.originator.as_deref(), turn_id, codex_turn_metadata),
             )
             .await
             .map_err(ImageBackendError::from_image_request)
@@ -107,19 +119,24 @@ impl CodexImagesBackend {
         &self,
         request: ImageEditRequest,
         turn_id: &str,
+        codex_turn_metadata: Option<&str>,
     ) -> Result<(ImageResponse, Option<String>), ImageBackendError> {
         self.client()
             .await?
             .edit(
                 &request,
-                image_request_headers(self.originator.as_deref(), turn_id),
+                image_request_headers(self.originator.as_deref(), turn_id, codex_turn_metadata),
             )
             .await
             .map_err(ImageBackendError::from_image_request)
     }
 }
 
-fn image_request_headers(originator: Option<&str>, turn_id: &str) -> HeaderMap {
+fn image_request_headers(
+    originator: Option<&str>,
+    turn_id: &str,
+    codex_turn_metadata: Option<&str>,
+) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if let Ok(turn_id) = HeaderValue::from_str(turn_id) {
         headers.insert(X_CODEX_IMAGE_TURN_ID_HEADER, turn_id);
@@ -127,5 +144,12 @@ fn image_request_headers(originator: Option<&str>, turn_id: &str) -> HeaderMap {
     if let Some(originator) = originator {
         add_originator_header(&mut headers, originator);
     }
+
+    if let Some(metadata) = codex_turn_metadata
+        && let Ok(metadata) = HeaderValue::from_str(metadata)
+    {
+        headers.insert(X_CODEX_TURN_METADATA_HEADER, metadata);
+    }
+
     headers
 }

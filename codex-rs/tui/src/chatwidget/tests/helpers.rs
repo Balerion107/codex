@@ -1,28 +1,32 @@
 use super::*;
+use crate::test_support::boxed_future;
+use codex_app_server_protocol::GeneratedImageRef;
 use codex_app_server_protocol::ImageGenerationItem;
 use codex_app_server_protocol::PluginAvailability;
 use codex_utils_absolute_path::test_support::PathExt;
+use pretty_assertions::assert_eq;
 
-pub(super) async fn test_config() -> Config {
+pub(super) async fn test_config() -> (tempfile::TempDir, Config) {
     // Start from the built-in defaults so tests do not inherit host/system config.
     let codex_home = tempfile::Builder::new()
         .prefix("chatwidget-tests-")
         .tempdir()
-        .expect("tempdir")
-        .keep();
-    let mut config =
-        Config::load_default_with_cli_overrides_for_codex_home(codex_home.clone(), Vec::new())
-            .await
-            .expect("config");
+        .expect("tempdir");
+    let mut config = Config::load_default_with_cli_overrides_for_codex_home(
+        codex_home.path().to_path_buf(),
+        Vec::new(),
+    )
+    .await
+    .expect("config");
     // Keep generic UI snapshots stable when the bundled catalog default changes.
     config.model = Some("gpt-5.6-sol".to_string());
-    config.codex_home = codex_home.abs();
-    config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.as_path().abs());
-    config.log_dir = codex_home.join("log");
+    config.codex_home = codex_home.path().abs();
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    config.log_dir = codex_home.path().join("log");
     config.cwd = PathBuf::from(test_path_display("/tmp/project")).abs();
     config.config_layer_stack = ConfigLayerStack::default();
     config.startup_warnings.clear();
-    config
+    (codex_home, config)
 }
 
 pub(super) fn test_project_path() -> PathBuf {
@@ -217,7 +221,7 @@ pub(super) async fn make_chatwidget_manual_with_auth(
     let (tx_raw, rx) = unbounded_channel::<AppEvent>();
     let app_event_tx = AppEventSender::new(tx_raw);
     let (op_tx, op_rx) = unbounded_channel::<Op>();
-    let mut cfg = test_config().await;
+    let (codex_home, mut cfg) = test_config().await;
     let resolved_model = model_override
         .map(str::to_owned)
         .unwrap_or_else(|| get_model_offline_for_tests(cfg.model.as_deref()));
@@ -249,6 +253,7 @@ pub(super) async fn make_chatwidget_manual_with_auth(
         session_telemetry,
     };
     let mut widget = ChatWidget::new_with_op_target(common, super::CodexOpTarget::Direct(op_tx));
+    widget.test_codex_home = Some(codex_home);
     widget.clock_format = crate::clock_format::ClockFormat::TwentyFourHour;
     widget.windows_sandbox_host = crate::app::WindowsSandboxHost::Local;
     widget.windows_sandbox_config.requirements = Some(None);
@@ -372,7 +377,7 @@ pub(crate) async fn make_chatwidget_manual_with_sender() -> (
     tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     tokio::sync::mpsc::UnboundedReceiver<Op>,
 ) {
-    let (widget, rx, op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (widget, rx, op_rx) = boxed_future!(make_chatwidget_manual(/*model_override*/ None)).await;
     let app_event_tx = AppEventSender::new(widget.app_event_tx.app_event_tx.clone());
     (widget, app_event_tx, rx, op_rx)
 }
@@ -852,10 +857,13 @@ pub(super) fn handle_image_generation_end(
                 id: call_id.into(),
                 status: status.into(),
                 revised_prompt,
-                result: String::new(),
+                image: GeneratedImageRef::Inline {
+                    result: String::new(),
+                },
                 transparent_background: None,
                 failure: None,
                 saved_path,
+                input_images: Vec::new(),
                 imagegen_request_id: None,
                 generation_id: None,
             }),
@@ -1128,6 +1136,7 @@ pub(super) fn app_server_turn(
 ) -> AppServerTurn {
     AppServerTurn {
         id: turn_id.to_string(),
+        root_turn_id: None,
         items_view: codex_app_server_protocol::TurnItemsView::Full,
         items: Vec::new(),
         status,
@@ -1346,7 +1355,7 @@ pub(crate) fn render_bottom_popup(chat: &ChatWidget, width: u16) -> String {
                 if symbol.is_empty() {
                     line.push(' ');
                 } else {
-                    line.push_str(symbol);
+                    line.push_str(&crate::terminal_hyperlinks::strip_osc8(symbol));
                 }
             }
             line.trim_end().to_string()
@@ -1449,7 +1458,6 @@ pub(super) fn plugins_test_summary(
     install_policy: PluginInstallPolicy,
 ) -> PluginSummary {
     PluginSummary {
-        extensions: None,
         id: id.to_string(),
         remote_plugin_id: None,
         version: None,
@@ -1486,7 +1494,6 @@ pub(super) fn plugins_test_remote_summary(
     installed: bool,
 ) -> PluginSummary {
     PluginSummary {
-        extensions: None,
         id: remote_plugin_id.to_string(),
         remote_plugin_id: Some(remote_plugin_id.to_string()),
         version: None,
@@ -1606,9 +1613,7 @@ pub(super) fn plugins_test_detail(
                 description: format!("{name} description"),
                 short_description: None,
                 interface: None,
-                path: Some(plugins_test_absolute_path(&format!(
-                    "skills/{name}/SKILL.md"
-                ))),
+                path: Some(plugins_test_absolute_path(&format!("skills/{name}/SKILL.md")).into()),
                 enabled: true,
             })
             .collect(),
@@ -1751,11 +1756,10 @@ pub(super) fn hook_run(
     }
 }
 
-pub(super) async fn assert_hook_events_snapshot(
+pub(super) async fn assert_hook_events(
     event_name: codex_app_server_protocol::HookEventName,
     run_id: &str,
     status_message: &str,
-    snapshot_name: &str,
 ) {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();
@@ -1816,7 +1820,7 @@ pub(super) async fn assert_hook_events_snapshot(
         .iter()
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
-    assert_chatwidget_snapshot!(snapshot_name, combined);
+    assert_eq!(combined, "↳ Hook · Heads up from the hook\n");
 }
 
 /// Normalize timestamps only in structurally identified completion footer cells.
@@ -1829,7 +1833,7 @@ pub(crate) fn normalize_completion_timestamps(
     }
     static COMPLETION_FOOTER: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(
         || {
-            regex_lite::Regex::new(r"(?m)^(?P<indent>[ \t]*)(?P<duration>Worked for (?:[0-9]+h )?(?:[0-9]+m )?[0-9]+s · )?(?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2}(?: (?:AM|PM))?(?P<padding>[ \t]*)$")
+            regex_lite::Regex::new(r"(?m)^(?P<indent>[ \t]*)(?P<duration>Worked for (?:<1s|(?:[0-9]+h )?(?:[0-9]+m )?[0-9]+s) • )?(?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2}(?: (?:AM|PM))?(?P<padding>[ \t]*)$")
                 .expect("valid completion footer pattern")
         },
     );
@@ -1838,7 +1842,7 @@ pub(crate) fn normalize_completion_timestamps(
             let indent = &captures["indent"];
             let padding = &captures["padding"];
             let duration = if captures.name("duration").is_some() {
-                "Worked for [duration] · "
+                "Worked for [duration] • "
             } else {
                 ""
             };

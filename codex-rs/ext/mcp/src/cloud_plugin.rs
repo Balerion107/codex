@@ -3,13 +3,13 @@
 use crate::PluginListQuery;
 use crate::PluginsThreadState;
 use crate::plugin_contributor::PluginContributor;
-use crate::plugin_contributor_state::SelectedPluginMetadata;
 use codex_core::config::Config;
 use codex_core_plugins::PluginCatalog;
 use codex_core_plugins::PluginIdentity;
 use codex_extension_api::ConfigContributor;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionFuture;
+use codex_extension_api::McpServerContribution;
 use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadStartInput;
 use codex_extension_api::TurnLifecycleContributor;
@@ -102,6 +102,7 @@ impl TurnLifecycleContributor for PluginContributor {
                     thread_id: input.thread_store.level_id().to_string(),
                     turn_id: input.turn_id.to_string(),
                     mcp_resources: resources.map(Arc::new),
+                    snapshots: Vec::new(),
                 })
                 .await
             {
@@ -118,41 +119,29 @@ impl TurnLifecycleContributor for PluginContributor {
 }
 
 /// Cloud packages contribute Apps attribution, never executor MCP declarations.
-pub(crate) struct CloudPluginMetadata {
-    pub(crate) selection_order: usize,
-    pub(crate) selected_root_id: String,
-    pub(crate) metadata: SelectedPluginMetadata,
-}
-
-pub(crate) fn catalog_to_metadata(catalog: &PluginCatalog) -> Vec<CloudPluginMetadata> {
+pub(crate) fn hosted_plugin_connectors(catalog: &PluginCatalog) -> Vec<McpServerContribution> {
     catalog
         .entries
         .iter()
-        .enumerate()
-        .filter_map(|(selection_order, entry)| {
+        .filter_map(|entry| {
             let PluginIdentity::Remote { remote_plugin_id } = &entry.id else {
                 return None;
             };
             let mut seen_connector_ids = HashSet::new();
-            Some(CloudPluginMetadata {
-                selection_order,
-                selected_root_id: format!("cloud:{remote_plugin_id}"),
-                metadata: SelectedPluginMetadata {
-                    plugin_id: remote_plugin_id.clone(),
-                    plugin_display_name: entry
-                        .display_name
-                        .chars()
-                        .take(MAX_PLUGIN_DISPLAY_NAME_CHARS)
-                        .collect(),
-                    servers: Vec::new(),
-                    connector_ids: entry
-                        .connector_ids
-                        .iter()
-                        .filter(|connector_id| seen_connector_ids.insert((*connector_id).clone()))
-                        .take(MAX_CONNECTOR_IDS_PER_PLUGIN)
-                        .cloned()
-                        .collect(),
-                },
+            Some(McpServerContribution::HostedPluginConnectors {
+                plugin_id: remote_plugin_id.clone(),
+                plugin_display_name: entry
+                    .display_name
+                    .chars()
+                    .take(MAX_PLUGIN_DISPLAY_NAME_CHARS)
+                    .collect(),
+                connector_ids: entry
+                    .connector_ids
+                    .iter()
+                    .filter(|connector_id| seen_connector_ids.insert((*connector_id).clone()))
+                    .take(MAX_CONNECTOR_IDS_PER_PLUGIN)
+                    .cloned()
+                    .collect(),
             })
         })
         .take(MAX_PROJECTED_CLOUD_PLUGINS)

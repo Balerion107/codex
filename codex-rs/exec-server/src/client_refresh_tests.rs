@@ -1,9 +1,13 @@
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
+use codex_config::ScopedSkillsConfig;
 use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
 use tokio::net::TcpListener;
@@ -13,9 +17,10 @@ use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 
 use super::*;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::NoiseChannelIdentity;
 use crate::ProcessId;
+use crate::discover_v2::capability_locations::tests as location_fixtures;
 use crate::noise_relay::stream_handler::NoiseOutboundMessage;
 use crate::noise_relay::stream_handler::NoiseStreamConnection;
 use crate::noise_relay::stream_handler::NoiseStreamHandler;
@@ -49,6 +54,8 @@ struct Registry {
     target: Mutex<Target>,
     next_lookup: Mutex<Option<oneshot::Receiver<()>>>,
     lookup_started: Notify,
+    offline: AtomicBool,
+    calls: AtomicUsize,
 }
 
 impl Registry {
@@ -65,6 +72,14 @@ impl NoiseRendezvousConnectProvider for Registry {
         _: NoiseChannelPublicKey,
     ) -> BoxFuture<'_, Result<NoiseRendezvousConnectBundle, ExecServerError>> {
         Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.offline.load(Ordering::Relaxed) {
+                return Err(ExecServerError::EnvironmentRegistryHttp {
+                    status: http::StatusCode::CONFLICT,
+                    code: Some("environment_offline".to_owned()),
+                    message: "executor is still starting".to_owned(),
+                });
+            }
             let target = self.target.lock().unwrap().clone();
             let block = self.next_lookup.lock().unwrap().take();
             if let Some(block) = block {
@@ -148,7 +163,7 @@ impl Executor {
         validator: Validator,
         identity: NoiseChannelIdentity,
     ) -> Result<Self> {
-        let processor = ConnectionProcessor::new(ExecServerRuntimePaths::new(
+        let processor = ConnectionProcessor::new(ExecServerRuntimeOptions::new(
             std::env::current_exe()?,
             /*codex_linux_sandbox_exe*/ None,
         )?);
@@ -203,6 +218,8 @@ impl Executor {
             target: Mutex::new(self.target.clone()),
             next_lookup: Mutex::new(None),
             lookup_started: Notify::new(),
+            offline: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
         });
         let client = LazyRemoteExecServerClient::new(
             ExecServerTransportParams::NoiseRendezvous {
@@ -269,14 +286,57 @@ async fn refresh_cancels_old_recovery_and_connects_without_resuming_old_session(
 #[tokio::test]
 async fn refresh_retires_a_still_connected_old_executor() -> Result<()> {
     let _clock = freeze_clock();
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    for name in ["old", "new"] {
+        location_fixtures::write(
+            &root.join(name),
+            &format!("codex/skills/{name}/SKILL.md"),
+            &format!("---\nname: {name}\ndescription: {name} executor\n---\n"),
+        )?;
+    }
     let old = Executor::start(Validator::default()).await?;
     let new = Executor::start(Validator::default()).await?;
+    old.processor
+        .seed_capability_locations(location_fixtures::request(&root.join("old"))?)
+        .await?;
+    new.processor
+        .seed_capability_locations(location_fixtures::request(&root.join("new"))?)
+        .await?;
     let (client, registry) = old.client()?;
     let original = client.get().await?;
+    let environment = Arc::new(crate::Environment::remote_with_client(
+        client.clone(),
+        /*local_runtime_paths*/ None,
+        ScopedSkillsConfig::default(),
+    ));
+    let cache = crate::ExecutorCapabilityDiscoveryV2Cache::default();
+    let request = crate::DiscoverV2CapabilitiesRequest {
+        cwd: codex_utils_path_uri::PathUri::from_host_native_path(&root)?,
+        sandbox: None,
+    };
+    let inventory = cache
+        .discover("environment", &environment, request.clone())
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(inventory.skills.iter().any(|skill| skill.name == "old"));
+    environment.refresh_connection().await?;
+    let reused = cache
+        .discover("environment", &environment, request.clone())
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(Arc::ptr_eq(&inventory, &reused));
     *registry.target.lock().unwrap() = new.target.clone();
-    client.refresh_connection().await?;
+    environment.refresh_connection().await?;
     assert!(original.is_disconnected());
     assert_ne!(original.session_id(), client.get().await?.session_id());
+    let refreshed = cache
+        .discover("environment", &environment, request)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(!Arc::ptr_eq(&inventory, &refreshed));
+    assert!(refreshed.skills.iter().any(|skill| skill.name == "new"));
+    assert!(!refreshed.skills.iter().any(|skill| skill.name == "old"));
     Ok(())
 }
 
@@ -306,8 +366,11 @@ async fn registration_snapshot_changes_only_after_same_key_replacement_is_instal
     };
     let new = Executor::start_with_identity(validator.clone(), old.target.identity.clone()).await?;
     let (client, registry) = old.client()?;
-    let environment =
-        crate::Environment::remote_with_client(client.clone(), /*local_runtime_paths*/ None);
+    let environment = crate::Environment::remote_with_client(
+        client.clone(),
+        /*local_runtime_paths*/ None,
+        ScopedSkillsConfig::default(),
+    );
     assert_eq!(environment.cached_executor_registration_id(), None);
     let original = client.get().await?;
     assert_eq!(
@@ -349,10 +412,14 @@ async fn registration_renewal_recovers_the_session_and_running_process() -> Resu
     )
     .await?;
     let (client, registry) = old.client()?;
-    let environment =
-        crate::Environment::remote_with_client(client.clone(), /*local_runtime_paths*/ None);
+    let environment = crate::Environment::remote_with_client(
+        client.clone(),
+        /*local_runtime_paths*/ None,
+        ScopedSkillsConfig::default(),
+    );
     let original = client.get().await?;
     let session_id = original.session_id();
+    assert_eq!(environment.executor_session_id().await?, session_id);
     let process =
         original
             .start_process(
@@ -399,6 +466,7 @@ async fn registration_renewal_recovers_the_session_and_running_process() -> Resu
     let recovered = client.get().await?;
     assert!(Arc::ptr_eq(&original.inner, &recovered.inner));
     assert_eq!(recovered.session_id(), session_id);
+    assert_eq!(environment.executor_session_id().await?, session_id);
     assert_eq!(
         process.write(b"after-renewal\n".to_vec()).await?.status,
         crate::protocol::WriteStatus::Accepted
@@ -435,8 +503,11 @@ async fn same_key_replacement_cannot_resume_a_missing_session() -> Result<()> {
     let replacement =
         Executor::start_with_identity(Validator::default(), old.target.identity.clone()).await?;
     let (client, registry) = old.client()?;
-    let environment =
-        crate::Environment::remote_with_client(client.clone(), /*local_runtime_paths*/ None);
+    let environment = crate::Environment::remote_with_client(
+        client.clone(),
+        /*local_runtime_paths*/ None,
+        ScopedSkillsConfig::default(),
+    );
     let original = client.get().await?;
     let process = original
         .register_session(&ProcessId::from("old-process"))
@@ -473,8 +544,11 @@ async fn stale_refresh_lookup_does_not_retire_a_renewed_session() -> Result<()> 
     )
     .await?;
     let (client, registry) = old.client()?;
-    let environment =
-        crate::Environment::remote_with_client(client.clone(), /*local_runtime_paths*/ None);
+    let environment = crate::Environment::remote_with_client(
+        client.clone(),
+        /*local_runtime_paths*/ None,
+        ScopedSkillsConfig::default(),
+    );
     let original = client.get().await?;
     let release = registry.block_next_lookup();
     let refreshing = client.refresh_connection();
@@ -632,6 +706,63 @@ async fn superseded_refresh_lookup_does_not_retire_a_newer_session() -> Result<(
     assert!(Arc::ptr_eq(&replacement.inner, &client.get().await?.inner));
     assert!(!replacement.inner.retired.is_cancelled());
     replacement.environment_status().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn provisioned_environment_waits_for_offline_executor_on_the_same_handle() -> Result<()> {
+    let _clock = freeze_clock();
+    let executor = Executor::start(Validator::default()).await?;
+    let (_, registry) = executor.client()?;
+    registry.offline.store(true, Ordering::Relaxed);
+    let manager = crate::EnvironmentManager::from_snapshot(
+        crate::environment_provider::EnvironmentProviderSnapshot {
+            environments: Vec::new(),
+            default: crate::environment_provider::EnvironmentDefault::Disabled,
+            include_local: false,
+        },
+        /*local_runtime_paths*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    )?;
+    let environment = manager
+        .report_environment_provisioning_status(
+            "environment".to_owned(),
+            Ok(crate::EnvironmentReadyInfo::default()),
+            registry.clone(),
+        )?
+        .expect("provisioned environment");
+    let ready = environment.wait_until_ready();
+    let info = environment.info();
+    tokio::pin!(ready, info);
+    assert!(futures::poll!(ready.as_mut()).is_pending());
+    assert!(futures::poll!(info.as_mut()).is_pending());
+    assert_eq!(registry.calls.load(Ordering::Relaxed), 1);
+
+    // A restore can outlast both the ordinary registry retry count and deadline.
+    for _ in 0..35 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(futures::poll!(ready.as_mut()).is_pending());
+        assert!(futures::poll!(info.as_mut()).is_pending());
+    }
+    assert!(registry.calls.load(Ordering::Relaxed) > 5);
+    let reported = manager
+        .report_environment_provisioning_status(
+            "environment".to_owned(),
+            Ok(crate::EnvironmentReadyInfo::default()),
+            registry.clone(),
+        )?
+        .expect("same provisioned environment");
+    assert!(Arc::ptr_eq(&environment, &reported));
+    assert!(futures::poll!(ready.as_mut()).is_pending());
+    assert!(futures::poll!(info.as_mut()).is_pending());
+
+    registry.offline.store(false, Ordering::Relaxed);
+    tokio::time::advance(Duration::from_secs(8)).await;
+    let ((), _) = tokio::try_join!(ready, info)?;
+    assert_eq!(
+        environment.cached_executor_registration_id(),
+        Some(executor.target.registration.clone())
+    );
     Ok(())
 }
 

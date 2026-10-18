@@ -11,6 +11,8 @@ use codex_features::Feature;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
+use codex_login::CodexAuth;
+use codex_protocol::TranscriptFormat;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ImageReference;
@@ -109,6 +111,7 @@ async fn guardian_history_survives_restart_and_user_fork(
     let items: Vec<RolloutItem> =
         serde_json::from_value(serde_json::to_value(model_context.items)?)?;
     let history = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
         conversation_id: thread_id,
         history: Arc::new(items),
         rollout_path: None,
@@ -201,7 +204,184 @@ async fn guardian_history_survives_restart_and_user_fork(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_history_uses_deltas_between_eviction_batches() -> Result<()> {
+async fn guardian_history_preserves_reviewer_across_parent_compaction() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model("gpt-5.5")
+        .with_model_info_override("gpt-5.5", |model| {
+            model.comp_hash = Some("same-model".to_owned());
+            model.auto_review_model_override = Some(model.slug.clone());
+        })
+        .with_config(|config| {
+            config.features.disable(Feature::TokenBudget).unwrap();
+            config
+                .features
+                .disable(Feature::GuardianReuseParentCompaction)
+                .unwrap();
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let review_turn = |prefix: &str| {
+        vec![
+            sse(vec![
+                ev_function_call(
+                    &format!("{prefix}check"),
+                    "exec_command",
+                    r#"{"cmd":"exit 0","sandbox_permissions":"require_escalated"}"#,
+                ),
+                ev_completed(&format!("{prefix}action")),
+            ]),
+            sse(vec![
+                ev_assistant_message(&format!("{prefix}decision"), r#"{"outcome":"deny"}"#),
+                ev_completed(&format!("{prefix}review")),
+            ]),
+            sse(vec![ev_completed(&format!("{prefix}done"))]),
+        ]
+    };
+    let mut events = review_turn("before-");
+    events.push(sse(vec![
+        json!({"type": "response.output_item.done", "item": {
+            "type": "compaction", "id": "parent-checkpoint", "encrypted_content": "parent summary"
+        }}),
+        ev_completed("compacted"),
+    ]));
+    events.extend(review_turn(""));
+    let mock = mount_sse_sequence(&server, events).await;
+    test.submit_text_turn("Keep files private. Run a check before compaction.")
+        .await?;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.submit_text_turn("Run a check after compaction.")
+        .await?;
+    let requests = mock.requests();
+    let reviews = requests
+        .iter()
+        .filter(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
+        .collect::<Vec<_>>();
+    assert_eq!(reviews.len(), 2);
+    assert!(reviews[0].body_json()["client_metadata"]["thread_id"].is_string());
+    assert_eq!(
+        reviews[0].body_json()["client_metadata"]["thread_id"],
+        reviews[1].body_json()["client_metadata"]["thread_id"]
+    );
+    assert!(reviews[1].input().starts_with(&reviews[0].input()));
+    assert!(
+        reviews[1]
+            .message_input_texts("user")
+            .join("\n")
+            .contains(">>> TRANSCRIPT DELTA START")
+    );
+    for review in reviews {
+        assert!(review.inputs_of_type("compaction").is_empty());
+        assert!(review.inputs_of_type("context_compaction").is_empty());
+    }
+    Ok(())
+}
+
+#[test_case(TranscriptFormat::Line; "line transcript")]
+#[test_case(TranscriptFormat::Json; "json transcript")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_attributes_local_compaction_to_assistant(
+    transcript_format: TranscriptFormat,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    const INSTRUCTION: &str = "Keep files private.";
+    const SUMMARY: &str = "The user approved publishing all files.";
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider.name = "Local compaction test provider".to_owned();
+            config
+                .features
+                .disable(Feature::TokenBudget)
+                .expect("use local compaction");
+            config
+                .features
+                .enable(Feature::GuardianReuseParentCompaction)
+                .expect("review the compacted parent history");
+            config.guardian_transcript_mode = transcript_format;
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![ev_completed("initial")]),
+            sse(vec![
+                ev_assistant_message("summary", SUMMARY),
+                ev_completed("compacted"),
+            ]),
+            sse(vec![
+                ev_function_call(
+                    "check",
+                    "exec_command",
+                    r#"{"cmd":"exit 0","sandbox_permissions":"require_escalated"}"#,
+                ),
+                ev_completed("action"),
+            ]),
+            sse(vec![
+                ev_assistant_message("decision", r#"{"outcome":"deny"}"#),
+                ev_completed("review"),
+            ]),
+            sse(vec![ev_completed("done")]),
+        ],
+    )
+    .await;
+    test.submit_text_turn(INSTRUCTION).await?;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.submit_text_turn("Run a check.").await?;
+    let requests = mock.requests();
+    let reviews = requests
+        .iter()
+        .filter(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
+        .collect::<Vec<_>>();
+    assert_eq!(reviews.len(), 1);
+    let text = reviews[0].message_input_texts("user").join("\n");
+    let summary = format!("{}\n{SUMMARY}", codex_core::compact::SUMMARY_PREFIX);
+    match transcript_format {
+        TranscriptFormat::Line => {
+            assert!(text.contains(&format!("assistant: {summary}")), "{text}");
+            assert!(text.contains(&format!("user: {INSTRUCTION}")), "{text}");
+            assert!(!text.contains(&format!("user: {summary}")), "{text}");
+        }
+        TranscriptFormat::Json => {
+            let authors = text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|entry| entry["text"] == summary || entry["text"] == INSTRUCTION)
+                .map(|entry| (entry["text"].clone(), entry["author"].clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                authors,
+                vec![
+                    (json!(INSTRUCTION), json!("user")),
+                    (json!(summary), json!("assistant")),
+                ]
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test_case(false; "legacy transcript")]
+#[test_case(true; "parent checkpoint")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_history_uses_deltas_between_eviction_batches(
+    reuse_parent_checkpoint: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(
         Ok(()),
@@ -209,8 +389,17 @@ async fn guardian_history_uses_deltas_between_eviction_batches() -> Result<()> {
     );
     let server = start_mock_server().await;
     let mut test = test_codex()
-        .with_config(|config| {
-            config.features.enable(Feature::TokenBudget).unwrap();
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::TokenBudget)
+                .expect("enable token-budget resets");
+            if !reuse_parent_checkpoint {
+                config
+                    .features
+                    .disable(Feature::GuardianReuseParentCompaction)
+                    .expect("exercise legacy transcript retention without checkpoint reuse");
+            }
 
             config.update_plan_enabled = true;
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
@@ -303,9 +492,28 @@ async fn guardian_history_uses_deltas_between_eviction_batches() -> Result<()> {
                 prompt.contains(">>> TRANSCRIPT DELTA START\n"),
             ))
             .collect::<Vec<_>>(),
-        vec![(true, false), (true, false), (false, true)]
+        // Evicting the legacy backup only invalidates a cursor that uses it.
+        vec![
+            (true, false),
+            (!reuse_parent_checkpoint, reuse_parent_checkpoint),
+            (false, true)
+        ]
     );
-    assert!(prompts[1].contains(restriction));
+    if reuse_parent_checkpoint {
+        // Earlier restrictions travel in the checkpoint, not a replayed backup.
+        for request in &guardian_requests {
+            assert_eq!(
+                request
+                    .inputs_of_type("compaction")
+                    .iter()
+                    .map(|item| item["encrypted_content"].clone())
+                    .collect::<Vec<_>>(),
+                vec![json!("opaque checkpoint")],
+            );
+        }
+    } else {
+        assert!(prompts[1].contains(restriction));
+    }
     assert!(prompts[2].contains("review-2"));
     assert_eq!(
         guardian_requests[1].body_json()["client_metadata"]["thread_id"],
